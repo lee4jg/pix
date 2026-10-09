@@ -63,7 +63,13 @@ import { printTimings, resetTimings, time } from "./core/timings.ts";
 import { hasTrustRequiringProjectResources, ProjectTrustStore } from "./core/trust-manager.ts";
 import { builtInExtensions } from "./extensions/index.ts";
 import { runMigrations, showDeprecationWarnings } from "./migrations.ts";
-import { InteractiveMode, runPrintMode, runRpcMode } from "./modes/index.ts";
+import {
+	InteractiveMode,
+	type LocalBridgeServer,
+	runPrintMode,
+	runRpcMode,
+	startLocalBridgeServer,
+} from "./modes/index.ts";
 import { initTheme, setThemeJsonValidator, stopThemeWatcher } from "./modes/interactive/theme/theme.ts";
 import { validateThemeJson } from "./modes/interactive/theme/theme-json.ts";
 import { cleanupManagedInstall, handleConfigCommand, handlePackageCommand } from "./package-manager-cli.ts";
@@ -931,10 +937,30 @@ export async function main(args: string[], options?: MainOptions) {
 			.finally(() => clearTimeout(timeout));
 	}
 
+	if (parsed.localBridgePort !== undefined && appMode !== "interactive") {
+		console.error(
+			chalk.yellow("Warning: --local-bridge-port is only supported in interactive mode and will be ignored"),
+		);
+	}
+
 	if (appMode === "rpc") {
 		printTimings();
 		await runRpcMode(runtime);
 	} else if (appMode === "interactive") {
+		let localBridge: LocalBridgeServer | undefined;
+		if (parsed.localBridgePort !== undefined) {
+			try {
+				localBridge = await startLocalBridgeServer({
+					port: parsed.localBridgePort,
+					getSession: () => runtime.session,
+				});
+			} catch (err) {
+				console.error(
+					chalk.red(`Failed to start local bridge server: ${err instanceof Error ? err.message : String(err)}`),
+				);
+				process.exit(1);
+			}
+		}
 		const interactiveMode = new InteractiveMode(runtime, {
 			migratedProviders,
 			startupDiagnostics,
@@ -946,6 +972,7 @@ export async function main(args: string[], options?: MainOptions) {
 			verbose: parsed.verbose,
 			tuiMode: parsed.tuiMode,
 			initialThemeSetting: parsed.useTheme,
+			localBridge,
 		});
 		if (startupBenchmark) {
 			await interactiveMode.init();

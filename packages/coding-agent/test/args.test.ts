@@ -529,4 +529,37 @@ describe("parseArgs", () => {
 			expect(result.messages).toEqual(["Do the task"]);
 		});
 	});
+
+	describe("--local-bridge-port flag", () => {
+		test("parses --local-bridge-port", () => {
+			const result = parseArgs(["--local-bridge-port", "9102"]);
+			expect(result.localBridgePort).toBe(9102);
+			expect(result.diagnostics.filter((d) => d.type === "error")).toEqual([]);
+		});
+
+		test("rejects non-numeric port", () => {
+			const result = parseArgs(["--local-bridge-port", "abc"]);
+			expect(result.localBridgePort).toBeUndefined();
+			expect(result.diagnostics.some((d) => d.type === "error" && d.message.includes("--local-bridge-port"))).toBe(
+				true,
+			);
+		});
+
+		test("rejects out-of-range ports", () => {
+			for (const value of ["0", "65536", "-1", "1.5"]) {
+				const result = parseArgs(["--local-bridge-port", value]);
+				expect(result.localBridgePort, value).toBeUndefined();
+				expect(
+					result.diagnostics.some((d) => d.type === "error"),
+					value,
+				).toBe(true);
+			}
+		});
+
+		test("rejects missing port value", () => {
+			const result = parseArgs(["--local-bridge-port"]);
+			expect(result.localBridgePort).toBeUndefined();
+			expect(result.diagnostics.some((d) => d.type === "error")).toBe(true);
+		});
+	});
 });

@@ -50,6 +50,8 @@ export interface Args {
 	tuiMode?: TuiMode;
 	verbose?: boolean;
 	projectTrustOverride?: boolean;
+	/** Port for the local HTTP bridge server (interactive mode only, binds 127.0.0.1). */
+	localBridgePort?: number;
 	messages: string[];
 	fileArgs: string[];
 	/** Unknown flags (potentially extension flags) - map of flag name to value */
@@ -138,6 +140,22 @@ export function parseArgs(args: string[]): Args {
 			result.fork = args[++i];
 		} else if (arg === "--session-dir" && i + 1 < args.length) {
 			result.sessionDir = args[++i];
+		} else if (arg === "--local-bridge-port") {
+			const raw = args[i + 1];
+			if (raw === undefined || raw.startsWith("-")) {
+				result.diagnostics.push({ type: "error", message: "--local-bridge-port requires a port number" });
+				continue;
+			}
+			i++;
+			const port = Number(raw);
+			if (!Number.isInteger(port) || port < 1 || port > 65535) {
+				result.diagnostics.push({
+					type: "error",
+					message: `Invalid --local-bridge-port "${raw}". Must be an integer between 1 and 65535`,
+				});
+				continue;
+			}
+			result.localBridgePort = port;
 		} else if (arg === "--models" && i + 1 < args.length) {
 			result.models = args[++i].split(",").map((s) => s.trim());
 		} else if (arg === "--no-tools" || arg === "-nt") {
@@ -298,6 +316,7 @@ ${chalk.bold("Options:")}
   --session-id <id>              Use exact project session ID, creating it if missing
   --fork <path|id>               Fork specific session file or partial UUID into a new session
   --session-dir <dir>            Directory for session storage and lookup
+  --local-bridge-port <port>     Serve a local HTTP bridge for external prompt injection (Feishu bridge); interactive mode only, binds 127.0.0.1
   --no-session                   Don't save session (ephemeral)
   --name, -n <name>              Set session display name
   --models <patterns>            Comma-separated model patterns for Ctrl+P cycling

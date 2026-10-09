@@ -1,0 +1,243 @@
+# 飞书桥（local-bridge）上游升级指南
+
+本 fork 在 pi 上叠加了一套飞书桥：`--local-bridge-port` 启动一个 127.0.0.1 上的 HTTP/SSE 服务，供外部桥客户端（`~/pi-feishu-bridge/config.json` → `connectUrl: http://127.0.0.1:9102`）注入 prompt、拉取事件、应答 TUI 弹窗。
+
+本文记录把 fork 升到新上游时保住这套桥的流程。方法论借鉴 `~/feishu-omp-bridge/docs/oh-my-pi-upgrade-guide.md` 与 `~/feishu-omp-bridge/oh-my-pi-18.8.6-upgrade.md`。
+
+## 当前基线
+
+| 项 | 值 |
+|---|---|
+| fork HEAD | `d5629e204`（`@earendil-works/pi-coding-agent` 0.87.1） |
+| 上游 | `earendil-works/pi` `main`，本地 clone 在 `~/org_pi` |
+| 上游 HEAD（本文成文时） | `b9ab918c6` — Release v1.0.3，领先 303 commits |
+| 桥的客户端 | `~/pi-feishu-bridge/config.json`（`connectUrl` 模式，不 spawn 二进制） |
+
+桥的代码全在 fork 侧，上游从未有过 `local-bridge` 目录，`InputSource` 上游仍是 `"interactive" | "rpc" | "extension"` 三值。
+
+## 一、桥的改动清单（KEEP 集合）
+
+**fork-only（上游没有，原样加回）：**
+
+| 文件 | 行数 | 说明 |
+|---|---|---|
+| `packages/coding-agent/src/modes/local-bridge/local-bridge-server.ts` | 386 | HTTP 服务本体：`/health` `/prompt` `/abort` `/events` `/ui-response` |
+| `packages/coding-agent/test/local-bridge-server.test.ts` | 336 | 11 个用例 |
+
+> 注意：这两个文件当前是 **untracked**（`git status` 里的 `??`）。升级前先 `git add` 提交，或至少 `cp` 到仓库外备份 —— untracked 文件在 `git checkout`/`reset` 类操作里不会被保护。
+
+**present-upstream（需要 3-way 合并）：**
+
+| 文件 | 我方 delta |
+|---|---|
+| `src/cli/args.ts` | `Args.localBridgePort` 字段 + `--local-bridge-port` 解析（校验 1–65535）+ help 文本一行 |
+| `src/main.ts` | `startLocalBridgeServer` 接线；非 interactive 模式打 warning；启动失败 `exit(1)`；把 `localBridge` 传给 `InteractiveMode` |
+| `src/modes/index.ts` | re-export `startLocalBridgeServer` / `LocalBridgeServer` |
+| `src/modes/interactive/interactive-mode.ts` | `localBridge` option；`rebindCurrentSession` 里 `attachSession`；`stop()` 里 `localBridge.stop()`；`raceDialogWithBridge` + 三个 `showExtension*WithBridge` 包装（把 TUI 弹窗与桥的 select/input 竞速）；`showExtensionEditor` 加 `signal` 形参 |
+| `src/core/extensions/types.ts` | `InputSource` 加 `"bridge"` |
+| `test/args.test.ts` | `--local-bridge-port` 四个用例 |
+| `test/auth-storage.test.ts` | 与桥无关：把 coalesced-reload 用例的 `"new"` 改成 `"new-key"`（同尺寸 in-place 重写在粗 mtime 文件系统上与旧内容不可区分） |
+
+合计 7 个 present-upstream 文件，fork delta 共 +201/-8。
+
+## 二、标准升级流程
+
+pi 是普通 monorepo（不是 subtree），所以**不需要** `patches/` + `merge-file` 那套；桥的改动直接以普通 git commit 落在 fork 分支上，`git merge upstream/main` 即可。但先做下面的预判，能省掉一次失败的 merge。
+
+### 步骤 0：备份与基线检查
+
+```bash
+cd ~/pi
+git status --porcelain          # 桥文件若是 untracked，先提交或备份到仓库外
+git branch backup/bridge-$(git rev-parse --short HEAD)
+```
+
+记下 `BASE=$(git rev-parse HEAD)`，后面所有 3-way 都以它为 base。
+
+### 步骤 1：拉上游并算出 KEEP 集合
+
+```bash
+git fetch origin main
+git fetch --no-tags ~/org_pi main     # 本地上游 clone；或直接用 origin/main
+git diff --numstat $BASE..FETCH_HEAD -- <bridge 文件>
+```
+
+### 步骤 2：预判冲突面（关键一步，别跳过）
+
+对每个 present-upstream 文件，把 **fork delta 的 base 坐标行段** 与 **上游 churn 的 base 坐标行段** 求交集。行坐标要统一到 base 侧：hunk 头 `@@ -o,oc +n,nc @@` 取 `o..o+oc-1`；`oc == 0` 的纯插入 hunk 退化成锚点 `o`。留 3–5 行容差，因为上游在文件头的插入会把所有下游行号推走。
+
+```bash
+# 每个文件跑一次，输出 near-N 计数；全 0 即零冲突预判
+# 见本文第四节脚本
+```
+
+实测结论（`d5629e204` → `b9ab918c6`）：
+
+| 文件 | fork hunk | 上游 hunk | 相交 |
+|---|---|---|---|
+| `interactive-mode.ts` | 12 | 142 | 0 |
+| `core/extensions/types.ts` | 1 | 39 | 0 |
+| `cli/args.ts` | 3 | 5 | 1（fork @140 纯插入 vs 上游 @142 `--models` 过滤空 pattern；不同分支，3-way 分得开） |
+| `main.ts` | 4 | 3 | 1（fork @66 import 区 vs 上游 @64 插入 `loadMcpCommand`；同一 import 块，3-way 分得开） |
+| `modes/index.ts` | 1 | 0 | 0 |
+| `test/args.test.ts` | 1 | 1 | 0 |
+| `test/auth-storage.test.ts` | 3 | 0 | 0 |
+
+### 步骤 3：3-way 合并（验证用，不落工作区）
+
+在合并前先证明能合干净。用 `git merge-file -p` 干跑，结果写仓库外：
+
+```bash
+for f in <7 个 present-upstream 文件>; do
+  git show $BASE:$f > /tmp/3way/$(basename $f).base
+  git show $UPSTREAM:$f > /tmp/3way/$(basename $f).theirs
+  cp "$f" /tmp/3way/$(basename $f).ours
+  git merge-file -p /tmp/3way/*.ours /tmp/3way/*.base /tmp/3way/*.theirs \
+    > /tmp/3way/*.merged && echo "CLEAN $f" || echo "CONFLICT $f"
+done
+```
+
+判零冲突之外，还要验**语义没被合坏**。逐项 grep merged 结果：
+
+- `cli_args.ts.merged`：`local-bridge-port` 解析在；上游的 `mcp <command>` help 行、`--tui-mode` 默认值翻转也在
+- `main.ts.merged`：`loadMcpCommand` / `runMcpCommand` 与 `startLocalBridgeServer` / `localBridge,` 同时在
+- `interactive-mode.ts.merged`：`raceDialogWithBridge`、`attachSession`、`localBridge?.stop()`、`showExtensionEditor(..., signal?)` 同时在
+
+最后做 delta 等价校验：`diff(merged, theirs)` 与 `diff(ours, base)` 的增删行数应逐文件相等（相等即 fork 补丁零漂移，只平移未变形）。本轮 7/7 相等。
+
+### 步骤 4：真正合并
+
+```bash
+git merge origin/main        # 或 merge FETCH_HEAD
+# 冲突时：只解自己改过的文件；桥的两个 fork-only 文件用 checkout/手动加回
+git add packages/coding-agent/src/modes/local-bridge/
+git commit
+```
+
+**坑：`git merge-file` 只改工作区、不 stage。** 若用 `merge-file` 手工三方合并，`git commit`（不带 `-a`）会丢掉全部桥补丁。commit 前 `git status` 确认桥文件在暂存区里。
+
+### 步骤 5：跟上上游的仓库结构变化
+
+这一轮（0.87.1 → 1.0.3）上游动了根配置，桥不受影响但构建会红：
+
+| 变化 | 处理 |
+|---|---|
+| `packages/session-backends/` 删除 | 从 `workspaces` 移除（上游已移除）；本地若引用其构建脚本需清 |
+| 新增 `packages/codemode`、`packages/mcp` | 加入 `build` / `build:offline` 链（上游已加） |
+| `npm-shrinkwrap.json` + `generate-coding-agent-shrinkwrap.mjs` 删除（`581e7ba78`） | 本 fork 仍 track 着 shrinkwrap 且 `check:shrinkwrap` 还在 `check` 链里 → 删掉该脚本调用与文件；`AGENTS.md` 里提到该脚本的段落也要删 |
+| `tsgo --noEmit` → `tsc --noEmit`，`typescript` 升到 7.0.2，移除 `@typescript/native-preview` | 跟上游；桥的代码是 erasable TS，不受影响 |
+| `build:binary` 入口点变化 | 上游改为 `./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/extensions/codemode/worker.ts` |
+| `pi` 二进制（`packages/coding-agent/binaries/`） | 在 `.gitignore:39`，本地产物，升级后需重新 `npm run build:binary` |
+
+### 步骤 6：验证门禁
+
+```bash
+# 1. 桥的单元测试（不依赖任何 provider API/key）
+node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run \
+  packages/coding-agent/test/local-bridge-server.test.ts
+# 期望：11 passed
+
+# 2. 参数解析
+node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run \
+  packages/coding-agent/test/args.test.ts
+
+# 3. 类型 + lint（桥文件在 src/ 内，tsgo/tsc 会覆盖）
+npm run check
+
+# 4. 全量非 e2e 测试
+./test.sh
+```
+
+端到端（手工）：
+
+```bash
+npm run build:binary
+./packages/coding-agent/binaries/linux-x64/pi --local-bridge-port 9102
+# 另一个终端
+curl -s localhost:9102/health
+# 然后让 ~/pi-feishu-bridge 指向 http://127.0.0.1:9102，发一条消息验证卡片流式
+```
+
+验收要点：
+
+- [ ] `local-bridge-server.test.ts` 11 passed
+- [ ] `args.test.ts` 全绿（含 4 个 `--local-bridge-port` 用例）
+- [ ] `npm run check` 零 error/warning
+- [ ] `./test.sh` 绿
+- [ ] `pi --local-bridge-port 9102` 起来后 `/health` 有响应
+- [ ] 飞书消息能注入 prompt 并收到流式卡片（验证 `/prompt` 的 `message_update` 携带完整累积 `message`）
+- [ ] 桥发起 select/input 时 TUI 弹窗同步出现，两侧任一应答另一侧收敛（验证 `raceDialogWithBridge`）
+- [ ] `/new` 或 fork 切会话后 `/events` 仍推流（验证 `attachSession`）
+
+## 三、桥侧的固有约束（改代码时别破坏）
+
+这些不是 fork 差异，是桥与 pi 会话之间的契约：
+
+1. **`/prompt` 的 `message_update` 必须携带完整累积 `message`。** 不要把事件过 `toJsonEvent` —— 它会剥掉 `message`，桥的流式卡片会空。
+2. **忙时返回 409，不排队。** `bridgePromptInFlight || session.isStreaming` 时直接 409。pi 自己的 `streamingBehavior` 队列不被桥协议使用。
+3. **客户端断开只停止转发，prompt 继续跑完并在 TUI 渲染**（ompX cancel 语义）。
+4. **`InputSource` 的 `"bridge"` 必须留着。** 桥用它把消息标记为非 TUI 来源；`session_turn_source` 会读它。
+5. **桥的弹窗竞速里，桥超时/cancel 返回 `undefined` 不算答案**，本地弹窗继续等；桥先答则 abort 本地，本地先答则 `cancelUIRequest` 掉桥的请求。
+6. **只绑 127.0.0.1，无鉴权。** 任何本地进程都能注入 prompt —— 与 ompX 桥同一信任模型，不要暴露到非 loopback。
+7. **`stop()` 必须幂等**，且 `interactive-mode.ts` 的 `stop()` 里要调 `localBridge.stop()`，否则进程退出时 SSE 连接泄漏。
+
+## 四、辅助脚本
+
+冲突预判（步骤 2）：
+
+```js
+// /tmp/overlap.mjs — 用法: node /tmp/overlap.mjs <base> <upstream>
+import { execSync } from "node:child_process";
+const [base, up] = process.argv.slice(2);
+const files = [
+	"packages/coding-agent/src/cli/args.ts",
+	"packages/coding-agent/src/core/extensions/types.ts",
+	"packages/coding-agent/src/main.ts",
+	"packages/coding-agent/src/modes/index.ts",
+	"packages/coding-agent/src/modes/interactive/interactive-mode.ts",
+	"packages/coding-agent/test/args.test.ts",
+	"packages/coding-agent/test/auth-storage.test.ts",
+];
+// 两侧都取 base 坐标：@@ -o,oc +n,nc @@ => o..o+oc-1；oc===0 退化为锚点 o
+function hunks(spec) {
+	const out = [];
+	for (const m of spec.matchAll(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/g)) {
+		const oc = m[2] === undefined ? 1 : Number(m[2]);
+		const o = Number(m[1]);
+		out.push({ s: o, e: oc === 0 ? o : o + oc - 1 });
+	}
+	return out;
+}
+const TOL = 5; // 行位移容差
+for (const f of files) {
+	const F = hunks(execSync(`git diff -U0 -- ${f}`, { encoding: "utf8" }));
+	const U = hunks(execSync(`git diff -U0 ${base} ${up} -- ${f}`, { encoding: "utf8" }));
+	const near = F.filter((h) => U.some((u) => h.s - TOL <= u.e && u.s <= h.e + TOL));
+	console.log(`${f}  fork=${F.length} up=${U.length} near=${near.length}`, JSON.stringify(near));
+}
+```
+
+delta 等价校验（步骤 3 末）：
+
+```bash
+# 逐文件：两者应相等
+diff -u X.merged X.theirs | grep -c '^+[^+]'   # 期望 == diff -u X.ours X.base 的 '^+[^+]' 计数
+diff -u X.merged X.theirs | grep -c '^-[^-]'   # 期望 == diff -u X.ours X.base 的 '^-[^-]' 计数
+```
+
+## 五、常见问题排查
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| merge "成功"但桥功能消失 | `merge-file` 结果未 stage，commit 时丢失 | `git status` 确认桥文件在暂存区；重做该文件合并 |
+| `local-bridge-server.test.ts` 编译失败（`AgentSessionEvent` 类型不匹配） | 上游给事件联合加了成员 | 对照 `git show $UPSTREAM:packages/coding-agent/src/core/agent-session.ts` 的事件联合；桥只 switch 6 个类型，其余走 default 忽略 |
+| `--local-bridge-port` 启动但 `/health` 连不上 | 二进制没重新构建，或 fork-only 文件没进构建产物 | `npm run build:binary` 后重试；确认 `src/modes/local-bridge/` 在仓库里（不是只在 untracked 且被 checkout 清掉） |
+| 飞书卡片空转 / 无流式 | 事件被过 `toJsonEvent`，`message` 被剥 | 见第三节约束 1 |
+| 飞书能发消息但 pi 无反应 | 桥起在非 interactive 模式 | `--local-bridge-port` 只在 interactive 生效，其他模式只打 warning |
+| 会话切换后 `/events` 断流 | `rebindCurrentSession` 没重新 attach | 该函数是 `attachSession` 的唯一调用点，检查它没被上游重命名/搬家 |
+
+## 六、版本历史
+
+| fork 基线 | 上游 | 结果 | 备注 |
+|---|---|---|---|
+| `d5629e204`（0.87.1） | `b9ab918c6`（1.0.3） | 7/7 present-upstream 3-way clean，delta 零漂移；桥 11 测试全绿 | 本文成文基准 |

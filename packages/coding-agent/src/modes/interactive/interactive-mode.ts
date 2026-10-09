@@ -126,6 +126,7 @@ import { killTrackedDetachedChildren } from "../../utils/shell.ts";
 import { loadAllHighlightLanguages } from "../../utils/syntax-highlight.ts";
 import { ensureTool, type ToolStatus } from "../../utils/tools-manager.ts";
 import { checkForNewPiVersion, type LatestPiRelease } from "../../utils/version-check.ts";
+import type { BridgeUIRequest, LocalBridgeServer } from "../local-bridge/local-bridge-server.ts";
 import { reportBug } from "./bug-report.ts";
 import { createChatViewport } from "./chat-viewport.ts";
 import { ArminComponent } from "./components/armin.ts";
@@ -410,6 +411,8 @@ export interface InteractiveModeOptions {
 	initialThemeSetting?: string;
 	/** Terminal implementation. Defaults to the current process terminal. */
 	terminal?: Terminal;
+	/** Local HTTP bridge server shared with this session (from --local-bridge-port). */
+	localBridge?: LocalBridgeServer;
 }
 
 export class InteractiveMode {
@@ -2021,6 +2024,10 @@ export class InteractiveMode {
 	private async rebindCurrentSession(options: { renderBeforeBind?: boolean } = {}): Promise<void> {
 		const session = this.session;
 
+		// The bridge broadcasts /events from its own session subscription, which
+		// must be re-attached after new_session/fork/switch replace the session object.
+		this.options.localBridge?.attachSession(session);
+
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
 		this.applyRuntimeSettings();
@@ -2536,9 +2543,9 @@ export class InteractiveMode {
 
 	private createExtensionUIContext(): ExtensionUIContext {
 		return {
-			select: (title, options, opts) => this.showExtensionSelector(title, options, opts),
+			select: (title, options, opts) => this.showExtensionSelectorWithBridge(title, options, opts),
 			confirm: (title, message, opts) => this.showExtensionConfirm(title, message, opts),
-			input: (title, placeholder, opts) => this.showExtensionInput(title, placeholder, opts),
+			input: (title, placeholder, opts) => this.showExtensionInputWithBridge(title, placeholder, opts),
 			notify: (message, type) => this.showExtensionNotify(message, type),
 			onTerminalInput: (handler) => this.addExtensionTerminalInputListener(handler),
 			setStatus: (key, text) => this.setExtensionStatus(key, text),
@@ -2559,7 +2566,7 @@ export class InteractiveMode {
 			pasteToEditor: (text) => this.editor.handleInput(`\x1b[200~${text}\x1b[201~`),
 			setEditorText: (text) => this.editor.setText(text),
 			getEditorText: () => this.editor.getExpandedText?.() ?? this.editor.getText(),
-			editor: (title, prefill) => this.showExtensionEditor(title, prefill),
+			editor: (title, prefill) => this.showExtensionEditorWithBridge(title, prefill),
 			addAutocompleteProvider: (factory) => {
 				this.autocompleteProviderWrappers.push(factory);
 				this.setupAutocompleteProvider();
@@ -2723,18 +2730,31 @@ export class InteractiveMode {
 	/**
 	 * Show a multi-line editor for extensions (with Ctrl+G support).
 	 */
-	private showExtensionEditor(title: string, prefill?: string): Promise<string | undefined> {
+	private showExtensionEditor(title: string, prefill?: string, signal?: AbortSignal): Promise<string | undefined> {
 		return new Promise((resolve) => {
+			if (signal?.aborted) {
+				resolve(undefined);
+				return;
+			}
+
+			const onAbort = () => {
+				this.hideExtensionEditor();
+				resolve(undefined);
+			};
+			signal?.addEventListener("abort", onAbort, { once: true });
+
 			this.extensionEditor = new ExtensionEditorComponent(
 				this.ui,
 				this.keybindings,
 				title,
 				prefill,
 				(value) => {
+					signal?.removeEventListener("abort", onAbort);
 					this.hideExtensionEditor();
 					resolve(value);
 				},
 				() => {
+					signal?.removeEventListener("abort", onAbort);
 					this.hideExtensionEditor();
 					resolve(undefined);
 				},
@@ -2759,6 +2779,94 @@ export class InteractiveMode {
 		this.extensionEditor = undefined;
 		this.ui.setFocus(this.editor);
 		this.ui.requestRender();
+	}
+
+	/**
+	 * Race a local TUI dialog against a bridge UI request (Feishu bridge) so
+	 * either the terminal or the phone can answer. Semantics mirror the ompX
+	 * bridge: a bridge timeout/cancel (undefined) is not an answer and the
+	 * local dialog keeps waiting; if the bridge answers first the local
+	 * dialog is dismissed, and if local answers first the bridge request is
+	 * dropped. Without a bridge this is just the local dialog.
+	 */
+	private raceDialogWithBridge(
+		bridge: LocalBridgeServer,
+		bridgeRequest: (bridge: LocalBridgeServer) => BridgeUIRequest,
+		showLocal: (signal: AbortSignal) => Promise<string | undefined>,
+	): Promise<string | undefined> {
+		const localAbort = new AbortController();
+		const request = bridgeRequest(bridge);
+		const local = showLocal(localAbort.signal).then((value) => ({ from: "tui", value }) as const);
+		const answered = request.result.then((value) =>
+			value === undefined ? new Promise<never>(() => {}) : ({ from: "bridge", value } as const),
+		);
+		return Promise.race([local, answered]).then((winner) => {
+			if (winner.from === "bridge") {
+				localAbort.abort();
+			} else {
+				bridge.cancelUIRequest(request.id);
+			}
+			return winner.value;
+		});
+	}
+
+	private mergeAbortSignals(...signals: Array<AbortSignal | undefined>): AbortSignal | undefined {
+		const present = signals.filter((signal): signal is AbortSignal => signal !== undefined);
+		if (present.length === 0) return undefined;
+		if (present.length === 1) return present[0];
+		return AbortSignal.any(present);
+	}
+
+	private showExtensionSelectorWithBridge(
+		title: string,
+		options: string[],
+		opts?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		const bridge = this.options.localBridge;
+		if (!bridge) {
+			return this.showExtensionSelector(title, options, opts);
+		}
+		return this.raceDialogWithBridge(
+			bridge,
+			(b) => b.requestSelect(title, options, opts?.timeout),
+			(signal) =>
+				this.showExtensionSelector(title, options, {
+					...opts,
+					signal: this.mergeAbortSignals(opts?.signal, signal),
+				}),
+		);
+	}
+
+	private showExtensionInputWithBridge(
+		title: string,
+		placeholder?: string,
+		opts?: ExtensionUIDialogOptions,
+	): Promise<string | undefined> {
+		const bridge = this.options.localBridge;
+		if (!bridge) {
+			return this.showExtensionInput(title, placeholder, opts);
+		}
+		return this.raceDialogWithBridge(
+			bridge,
+			(b) => b.requestInput(title, placeholder, opts?.timeout),
+			(signal) =>
+				this.showExtensionInput(title, placeholder, {
+					...opts,
+					signal: this.mergeAbortSignals(opts?.signal, signal),
+				}),
+		);
+	}
+
+	private showExtensionEditorWithBridge(title: string, prefill?: string): Promise<string | undefined> {
+		const bridge = this.options.localBridge;
+		if (!bridge) {
+			return this.showExtensionEditor(title, prefill);
+		}
+		return this.raceDialogWithBridge(
+			bridge,
+			(b) => b.requestInput(title, prefill),
+			(signal) => this.showExtensionEditor(title, prefill, signal),
+		);
 	}
 
 	/**
@@ -6831,6 +6939,7 @@ export class InteractiveMode {
 	}
 
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
+		this.options.localBridge?.stop();
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);
