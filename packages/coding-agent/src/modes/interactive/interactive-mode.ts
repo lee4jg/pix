@@ -2095,7 +2095,8 @@ export class InteractiveMode {
 
 		// The bridge broadcasts /events from its own session subscription, which
 		// must be re-attached after new_session/fork/switch replace the session object.
-		this.options.localBridge?.attachSession(session);
+		// this.options is absent when this method is invoked on a bare prototype stub.
+		this.options?.localBridge?.attachSession(session);
 
 		this.unsubscribe?.();
 		this.unsubscribe = undefined;
@@ -7196,7 +7197,7 @@ export class InteractiveMode {
 	}
 
 	stop(fullscreenExitOutput = this.settingsManager.getFullscreenExitOutput()): void {
-		this.options.localBridge?.stop();
+		this.options?.localBridge?.stop();
 		this.disposeActiveSelector();
 		if (this.settingsManager.getShowTerminalProgress()) {
 			this.ui.terminal.setProgress(false);

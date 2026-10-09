@@ -8,10 +8,12 @@
 
 | 项 | 值 |
 |---|---|
-| fork HEAD | `d5629e204`（`@earendil-works/pi-coding-agent` 0.87.1） |
+| fork HEAD（本文初稿） | `d5629e204`（`@earendil-works/pi-coding-agent` 0.87.1） |
 | 上游 | `earendil-works/pi` `main`，本地 clone 在 `~/org_pi` |
-| 上游 HEAD（本文成文时） | `b9ab918c6` — Release v1.0.3，领先 303 commits |
+| 已升级到的上游 | `b9ab918c6` — Release v1.0.3，303 commits。本地 remote 名 `upstream-local` 指向 `~/org_pi` |
 | 桥的客户端 | `~/pi-feishu-bridge/config.json`（`connectUrl` 模式，不 spawn 二进制） |
+
+升级后 fork 的包版本是 `@earendil-works/pi-coding-agent` 1.1.0（`pi --version` 输出 `1.1.0`，与上游 git tag `v1.0.3` 不是同一套号）。
 
 桥的代码全在 fork 侧，上游从未有过 `local-bridge` 目录，`InputSource` 上游仍是 `"interactive" | "rpc" | "extension"` 三值。
 
@@ -85,7 +87,7 @@ git diff --numstat $BASE..FETCH_HEAD -- <bridge 文件>
 
 ### 步骤 3：3-way 合并（验证用，不落工作区）
 
-在合并前先证明能合干净。用 `git merge-file -p` 干跑，结果写仓库外：
+在合并前先证明能合干净。pi 是普通 monorepo，本轮实测 `git merge` 直接零冲突 —— 预判的价值在于**提前知道会是零冲突**，出问题时才有对照。用 `git merge-file -p` 干跑，结果写仓库外：
 
 ```bash
 for f in <7 个 present-upstream 文件>; do
@@ -108,7 +110,9 @@ done
 ### 步骤 4：真正合并
 
 ```bash
-git merge origin/main        # 或 merge FETCH_HEAD
+git remote add upstream-local ~/org_pi     # 本地上游 clone；已有 origin 就直接用它
+git fetch --no-tags upstream-local main
+git merge upstream-local/main
 # 冲突时：只解自己改过的文件；桥的两个 fork-only 文件用 checkout/手动加回
 git add packages/coding-agent/src/modes/local-bridge/
 git commit
@@ -127,7 +131,23 @@ git commit
 | `npm-shrinkwrap.json` + `generate-coding-agent-shrinkwrap.mjs` 删除（`581e7ba78`） | 本 fork 仍 track 着 shrinkwrap 且 `check:shrinkwrap` 还在 `check` 链里 → 删掉该脚本调用与文件；`AGENTS.md` 里提到该脚本的段落也要删 |
 | `tsgo --noEmit` → `tsc --noEmit`，`typescript` 升到 7.0.2，移除 `@typescript/native-preview` | 跟上游；桥的代码是 erasable TS，不受影响 |
 | `build:binary` 入口点变化 | 上游改为 `./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/extensions/codemode/worker.ts` |
-| `pi` 二进制（`packages/coding-agent/binaries/`） | 在 `.gitignore:39`，本地产物，升级后需重新 `npm run build:binary` |
+| `pi` 二进制 | `build:binary` 输出在 `packages/coding-agent/dist/pi`（不在 `binaries/`，那个目录是下载的官方发行包缓存），本地产物，升级后需重新构建 |
+
+merge 本身会把这些都自动处理掉（`package.json` 的 `workspaces`/`check` 链、`AGENTS.md` 的 shrinkwrap 段落、shrinkwrap 文件与脚本都是上游直接覆盖/删除）。**要自己动手的是数据生成和 Rust 侧：**
+
+```bash
+# 模型数据是 gitignore 的生成物（.gitignore:11 → packages/ai/src/providers/data/）。
+# 上游新增 provider（如 azure）后本地没有对应 data/*.json，tsc 会报几十个
+# "Type 'unknown' does not satisfy the constraint 'ModelGroups'" 和
+# "'gpt-4o-mini' is not assignable to parameter of type 'never'"。
+# 根因不是类型回归，是 data 缺失。
+npm run generate:models      # packages/ai/scripts/generate-models.ts
+
+# packages/env 是上游新增的 Rust workspace，测试前必须先建 daemon
+npm run build:daemon --workspace packages/env   # cargo build --manifest-path daemon/Cargo.toml --locked
+```
+
+顺序照 CI（`.github/workflows/ci.yml`）：`npm ci --ignore-scripts` → `npm run build` → `npm run check` → `npm run build:daemon --workspace packages/env` → `npm test`。`generate:models` 已包含在 `packages/ai` 的 `build` 里。
 
 ### 步骤 6：验证门禁
 
@@ -141,21 +161,23 @@ node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run \
 node "$(git rev-parse --show-toplevel)/node_modules/vitest/dist/cli.js" --run \
   packages/coding-agent/test/args.test.ts
 
-# 3. 类型 + lint（桥文件在 src/ 内，tsgo/tsc 会覆盖）
+# 3. 类型 + lint（桥文件在 src/ 内，tsc 会覆盖）
 npm run check
 
 # 4. 全量非 e2e 测试
 ./test.sh
 ```
 
-端到端（手工）：
+端到端（`--local-bridge-port` 只在 interactive 模式生效，需要真 TTY；用 `pty.openpty()` 起进程即可）：
 
 ```bash
-npm run build:binary
-./packages/coding-agent/binaries/linux-x64/pi --local-bridge-port 9102
+npm --prefix packages/coding-agent run build:binary
+./packages/coding-agent/dist/pi --local-bridge-port 9399   # 另开 pty
 # 另一个终端
-curl -s localhost:9102/health
-# 然后让 ~/pi-feishu-bridge 指向 http://127.0.0.1:9102，发一条消息验证卡片流式
+curl -s localhost:9399/health                              # => ok
+curl -sN localhost:9399/events | head -1                   # => text/event-stream
+curl -s -XPOST localhost:9399/prompt -d '{"message":""}'   # => 400 {"error":"message must be a non-empty string"}
+# 然后让 ~/pi-feishu-bridge 指向 http://127.0.0.1:9399，发一条消息验证卡片流式
 ```
 
 验收要点：
@@ -164,7 +186,7 @@ curl -s localhost:9102/health
 - [ ] `args.test.ts` 全绿（含 4 个 `--local-bridge-port` 用例）
 - [ ] `npm run check` 零 error/warning
 - [ ] `./test.sh` 绿
-- [ ] `pi --local-bridge-port 9102` 起来后 `/health` 有响应
+- [ ] `pi --local-bridge-port <port>` 起来后 `/health` 返回 `ok`、`/events` 是 `text/event-stream`、`/prompt` 空 body 返回 400
 - [ ] 飞书消息能注入 prompt 并收到流式卡片（验证 `/prompt` 的 `message_update` 携带完整累积 `message`）
 - [ ] 桥发起 select/input 时 TUI 弹窗同步出现，两侧任一应答另一侧收敛（验证 `raceDialogWithBridge`）
 - [ ] `/new` 或 fork 切会话后 `/events` 仍推流（验证 `attachSession`）
@@ -180,6 +202,7 @@ curl -s localhost:9102/health
 5. **桥的弹窗竞速里，桥超时/cancel 返回 `undefined` 不算答案**，本地弹窗继续等；桥先答则 abort 本地，本地先答则 `cancelUIRequest` 掉桥的请求。
 6. **只绑 127.0.0.1，无鉴权。** 任何本地进程都能注入 prompt —— 与 ompX 桥同一信任模型，不要暴露到非 loopback。
 7. **`stop()` 必须幂等**，且 `interactive-mode.ts` 的 `stop()` 里要调 `localBridge.stop()`，否则进程退出时 SSE 连接泄漏。
+8. **对 `this.options` 的访问要容忍它不存在。** 上游的回归测试用 `InteractiveMode.prototype.rebindCurrentSession.call(bareStub)` 直接调私有方法，stub 对象上没有 `options` 字段。桥在 `rebindCurrentSession` / `stop` 里读 `this.options.localBridge` 时写成 `this.options?.localBridge?.`，否则这些测试会以 `TypeError: Cannot read properties of undefined (reading 'localBridge')` 挂掉 —— 而且挂的是**上游**的测试，看起来像升级引入的回归。
 
 ## 四、辅助脚本
 
@@ -235,9 +258,13 @@ diff -u X.merged X.theirs | grep -c '^-[^-]'   # 期望 == diff -u X.ours X.base
 | 飞书卡片空转 / 无流式 | 事件被过 `toJsonEvent`，`message` 被剥 | 见第三节约束 1 |
 | 飞书能发消息但 pi 无反应 | 桥起在非 interactive 模式 | `--local-bridge-port` 只在 interactive 生效，其他模式只打 warning |
 | 会话切换后 `/events` 断流 | `rebindCurrentSession` 没重新 attach | 该函数是 `attachSession` 的唯一调用点，检查它没被上游重命名/搬家 |
+| `tsc` 报几十个 `Type 'unknown' does not satisfy 'ModelGroups'` / `'x' is not assignable to 'never'` | `packages/ai/src/providers/data/*.json` 是 gitignore 的生成物，上游新增 provider 后本地缺对应文件 | `npm run generate:models`；不是类型回归 |
+| `./test.sh` 里 `packages/env` 5 个 suite 报 `Build the daemon first` | 上游新增的 Rust workspace，daemon 未构建 | `npm run build:daemon --workspace packages/env` |
+| `./test.sh` 里 `openai-chatgpt-oauth.test.ts` 报 `Port 1455 is in use` | 本机有并发 pi 登录占着 OAuth 回调端口 | 无关代码；关掉占用进程后重跑该文件 |
+| 上游新加的回归测试报 `Cannot read properties of undefined (reading 'localBridge')` | 桥在私有方法里读 `this.options.localBridge`，而上游测试用 bare prototype stub 调用该方法 | 见第三节约束 8；改成 `this.options?.localBridge?.` |
 
 ## 六、版本历史
 
 | fork 基线 | 上游 | 结果 | 备注 |
 |---|---|---|---|
-| `d5629e204`（0.87.1） | `b9ab918c6`（1.0.3） | 7/7 present-upstream 3-way clean，delta 零漂移；桥 11 测试全绿 | 本文成文基准 |
+| `d5629e204`（0.87.1） | `b9ab918c6`（1.0.3） | `git merge` 零冲突；7/7 present-upstream 补丁零漂移 | 2026-10-09 实测。`npm run check` exit 0；`./test.sh` exit 0；`/health` → `ok`、`/events` → `text/event-stream`、`/prompt` 空 body → 400。修复一处桥的 `this.options` 兼容（见约束 8） |
