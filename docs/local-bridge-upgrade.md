@@ -8,12 +8,12 @@
 
 | 项 | 值 |
 |---|---|
-| fork HEAD（本文初稿） | `d5629e204`（`@earendil-works/pi-coding-agent` 0.87.1） |
+| fork 基线（上一轮升级后） | `60c329cea`（`@earendil-works/pi-coding-agent` 1.1.0，上游 `b9ab918c6` = v1.0.3） |
 | 上游 | `earendil-works/pi` `main`，本地 clone 在 `~/org_pi` |
-| 已升级到的上游 | `b9ab918c6` — Release v1.0.3，303 commits。本地 remote 名 `upstream-local` 指向 `~/org_pi` |
+| 本轮升级到的上游 | `16f5f0af4`，195 commits（包版本 1.1.0 → 1.3.0）。本地 remote 名 `upstream-local` 指向 `~/org_pi` |
 | 桥的客户端 | `~/pi-feishu-bridge/config.json`（`connectUrl` 模式，不 spawn 二进制） |
 
-升级后 fork 的包版本是 `@earendil-works/pi-coding-agent` 1.1.0（`pi --version` 输出 `1.1.0`，与上游 git tag `v1.0.3` 不是同一套号）。
+升级后 fork 的包版本是 `@earendil-works/pi-coding-agent` 1.3.0（`pi --version` 输出与上游 git tag 不是同一套号）。
 
 桥的代码全在 fork 侧，上游从未有过 `local-bridge` 目录，`InputSource` 上游仍是 `"interactive" | "rpc" | "extension"` 三值。
 
@@ -26,7 +26,7 @@
 | `packages/coding-agent/src/modes/local-bridge/local-bridge-server.ts` | 386 | HTTP 服务本体：`/health` `/prompt` `/abort` `/events` `/ui-response` |
 | `packages/coding-agent/test/local-bridge-server.test.ts` | 336 | 11 个用例 |
 
-> 注意：这两个文件当前是 **untracked**（`git status` 里的 `??`）。升级前先 `git add` 提交，或至少 `cp` 到仓库外备份 —— untracked 文件在 `git checkout`/`reset` 类操作里不会被保护。
+> 这两个文件自 `bd85b0f33` 起已 **tracked**（初稿时是 untracked，风险见下）。若将来再新增 fork-only 文件，升级前先 `git add` 提交或 `cp` 到仓库外备份 —— untracked 文件在 `git checkout`/`reset` 类操作里不会被保护。
 
 **present-upstream（需要 3-way 合并）：**
 
@@ -141,10 +141,41 @@ merge 本身会把这些都自动处理掉（`package.json` 的 `workspaces`/`ch
 # "Type 'unknown' does not satisfy the constraint 'ModelGroups'" 和
 # "'gpt-4o-mini' is not assignable to parameter of type 'never'"。
 # 根因不是类型回归，是 data 缺失。
-npm run generate:models      # packages/ai/scripts/generate-models.ts
+#
+# 首选：从固定 catalog revision 复现 Nix 构建的 data（确定性，与上游测试的模型 id 一致）。
+# 上游源码里的测试硬编码了 pin 里的模型 id，实时目录会漂移出差异
+# （本轮实时 models.dev 已下线 gpt-5-mini / claude-opus-4.7 / Kimi-K2.6，
+#  而 nix/model-catalog.json 的旧 pin 缺 nvidia/nemotron-3.5-super-vl-120b-a12b）。
+npm run update:model-catalog-pin    # 拉实时目录、校验能 hydrate 本 checkout，写 nix/model-catalog.json
+# 再按新 pin 的字节 hydrate 本地 data（hydrate 不会由上一条命令代做，它只更新 pin）：
+node --input-type=module -e '
+  import { readFileSync } from "node:fs";
+  import { hydrateModelCatalogBytes } from "./scripts/update-model-catalog-pin.mjs";
+  const rev = JSON.parse(readFileSync("nix/model-catalog.json", "utf8")).revision;
+  const res = await fetch(`https://pi.dev/api/models/revisions/${rev}?types=chat,image,classifier`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  hydrateModelCatalogBytes(process.cwd(), Buffer.from(await res.arrayBuffer()));
+' 2>&1 | tail -2                      # 需 NODE_OPTIONS=--dns-result-order=ipv4first；.ts 导入依赖 Node 24 strip-types
+npm run generate:models               # 备选：抓实时 models.dev，仅当 pin 也拿不到时用；可能让 tsc 与上游测试脱节
 
 # packages/env 是上游新增的 Rust workspace，测试前必须先建 daemon
 npm run build:daemon --workspace packages/env   # cargo build --manifest-path daemon/Cargo.toml --locked
+```
+
+本环境 Node 的 `fetch` 走 IPv6 会 `ETIMEDOUT`（`internalConnectMultiple`），curl 正常。所有联网的生成/下载命令加
+`NODE_OPTIONS=--dns-result-order=ipv4first`。
+
+`packages/coding-agent/binaries/`（gitignore 的官方发行包下载缓存）里的旧 `package.json` 会让
+`npm run check` 的 `check:pinned-deps` 报 `must be pinned, found ^0.87.1`——清掉或移出仓库，上游 CI 是干净 clone 所以不会碰到。
+
+`build:binary` 会先跑 `npm --prefix ../ai run build`（联网重生成模型数据）。数据已按 pin hydrate 过时，
+直接执行其中的 bun 步骤更快也更可靠：
+
+```bash
+cd packages/coding-agent
+bun build --compile --no-compile-autoload-bunfig --no-compile-autoload-dotenv \
+  ./dist/bun/cli.js ./src/utils/image-resize-worker.ts ./src/extensions/codemode/worker.ts \
+  --outfile dist/pi && npm run copy-binary-assets
 ```
 
 顺序照 CI（`.github/workflows/ci.yml`）：`npm ci --ignore-scripts` → `npm run build` → `npm run check` → `npm run build:daemon --workspace packages/env` → `npm test`。`generate:models` 已包含在 `packages/ai` 的 `build` 里。
@@ -262,9 +293,14 @@ diff -u X.merged X.theirs | grep -c '^-[^-]'   # 期望 == diff -u X.ours X.base
 | `./test.sh` 里 `packages/env` 5 个 suite 报 `Build the daemon first` | 上游新增的 Rust workspace，daemon 未构建 | `npm run build:daemon --workspace packages/env` |
 | `./test.sh` 里 `openai-chatgpt-oauth.test.ts` 报 `Port 1455 is in use` | 本机有并发 pi 登录占着 OAuth 回调端口 | 无关代码；关掉占用进程后重跑该文件 |
 | 上游新加的回归测试报 `Cannot read properties of undefined (reading 'localBridge')` | 桥在私有方法里读 `this.options.localBridge`，而上游测试用 bare prototype stub 调用该方法 | 见第三节约束 8；改成 `this.options?.localBridge?.` |
+| `check:pinned-deps` 报 `binaries/.../package.json: must be pinned, found ^0.87.1` | `packages/coding-agent/binaries/` 是 gitignore 的旧发行包缓存，该检查会遍历全仓库 package.json | 把该目录移出仓库（或重下当前版本），不是代码问题 |
+| `tsc` 报某些模型 id `is not assignable to` 联合类型（且 `packages/ai` 与上游零差异） | 本地 data 与上游期望的 catalog revision 不一致：实时 models.dev 已下线这些 id，或 pin 比上游测试旧 | 按步骤 5 用 `update:model-catalog-pin` + hydrate 从 pin 重建 data，别用实时 `generate:models` |
+| `npm run generate:models` / `build:binary` 里 `[TypeError: fetch failed] ETIMEDOUT` | Node 的 DNS 排序走了不可达的 IPv6（curl 同一 URL 正常） | `NODE_OPTIONS=--dns-result-order=ipv4first`；`build:binary` 可只跑 bun 步骤 |
+| `./test.sh` 每次挂在不同用例（`worker-lifetime`、`compaction`），单跑全绿 | 20 核并发下计时敏感用例的资源抖动 | 单跑确认后整体重跑；不是升级引入的回归 |
 
 ## 六、版本历史
 
 | fork 基线 | 上游 | 结果 | 备注 |
 |---|---|---|---|
 | `d5629e204`（0.87.1） | `b9ab918c6`（1.0.3） | `git merge` 零冲突；7/7 present-upstream 补丁零漂移 | 2026-10-09 实测。`npm run check` exit 0；`./test.sh` exit 0；`/health` → `ok`、`/events` → `text/event-stream`、`/prompt` 空 body → 400。修复一处桥的 `this.options` 兼容（见约束 8） |
+| `60c329cea`（1.1.0） | `16f5f0af4`（1.3.0，195 commits） | 6/7 文件自动合并零冲突；`interactive-mode.ts` 3 块冲突，手工解 | 2026-10-21 实测。上游 `38847563f` 把弹窗改成栈式（`pushExtensionDialog`/`removeExtensionDialog`，删掉 `hideExtensionEditor` 与 `extensionEditor` 字段），与桥的 `showExtensionEditor(..., signal?)` 同区冲突。解法：保留上游结构，把 `signal` 重新接进 `finish()`（`onAbort = () => finish(undefined)`、`finish` 里 `removeEventListener` + `removeExtensionDialog(editor)`），删掉我方 `hideExtensionEditor` 副本。delta 等价 7/7 成立（`interactive-mode.ts` +102/-4 vs 原 +106/-4，差 4 行正是不再需要带回 `hideExtensionEditor`）。`npm run check` exit 0；`./test.sh` exit 0；桥 11 passed、args 96 passed；`dist/pi --local-bridge-port 9399` → `/health` `ok`、`/events` `text/event-stream`、`/prompt` 空 body 400。另需 `update:model-catalog-pin` bump（tracked）与移走 `binaries/` 旧缓存 |
