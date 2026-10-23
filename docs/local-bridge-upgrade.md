@@ -8,12 +8,12 @@
 
 | 项 | 值 |
 |---|---|
-| fork 基线（上一轮升级后） | `60c329cea`（`@earendil-works/pi-coding-agent` 1.1.0，上游 `b9ab918c6` = v1.0.3） |
+| fork 基线（上一轮升级后） | `7fbdcb45c`（`@earendil-works/pi-coding-agent` 1.3.0，上游 `16f5f0af4`） |
 | 上游 | `earendil-works/pi` `main`，本地 clone 在 `~/org_pi` |
-| 本轮升级到的上游 | `16f5f0af4`，195 commits（包版本 1.1.0 → 1.3.0）。本地 remote 名 `upstream-local` 指向 `~/org_pi` |
+| 本轮升级到的上游 | `936e5f40a`（tag v1.4.0），42 commits（包版本 1.3.0 → 1.4.0）。本地 remote 名 `upstream-local` 指向 `~/org_pi` |
 | 桥的客户端 | `~/pi-feishu-bridge/config.json`（`connectUrl` 模式，不 spawn 二进制） |
 
-升级后 fork 的包版本是 `@earendil-works/pi-coding-agent` 1.3.0（`pi --version` 输出与上游 git tag 不是同一套号）。
+升级后 fork 的包版本是 `@earendil-works/pi-coding-agent` 1.4.0（`pi --version` 输出与上游 git tag 不是同一套号）。
 
 桥的代码全在 fork 侧，上游从未有过 `local-bridge` 目录，`InputSource` 上游仍是 `"interactive" | "rpc" | "extension"` 三值。
 
@@ -295,7 +295,7 @@ diff -u X.merged X.theirs | grep -c '^-[^-]'   # 期望 == diff -u X.ours X.base
 | 上游新加的回归测试报 `Cannot read properties of undefined (reading 'localBridge')` | 桥在私有方法里读 `this.options.localBridge`，而上游测试用 bare prototype stub 调用该方法 | 见第三节约束 8；改成 `this.options?.localBridge?.` |
 | `check:pinned-deps` 报 `binaries/.../package.json: must be pinned, found ^0.87.1` | `packages/coding-agent/binaries/` 是 gitignore 的旧发行包缓存，该检查会遍历全仓库 package.json | 把该目录移出仓库（或重下当前版本），不是代码问题 |
 | `tsc` 报某些模型 id `is not assignable to` 联合类型（且 `packages/ai` 与上游零差异） | 本地 data 与上游期望的 catalog revision 不一致：实时 models.dev 已下线这些 id，或 pin 比上游测试旧 | 按步骤 5 用 `update:model-catalog-pin` + hydrate 从 pin 重建 data，别用实时 `generate:models` |
-| `npm run generate:models` / `build:binary` 里 `[TypeError: fetch failed] ETIMEDOUT` | Node 的 DNS 排序走了不可达的 IPv6（curl 同一 URL 正常） | `NODE_OPTIONS=--dns-result-order=ipv4first`；`build:binary` 可只跑 bun 步骤 |
+| `npm run generate:models` / `build:binary` / 根 `npm run build` 里 `[TypeError: fetch failed] ETIMEDOUT` | Node 的 DNS 排序走了不可达的 IPv6（curl 同一 URL 正常）；加了 `ipv4first` 后仍可能有厂商 API 不可达 | `NODE_OPTIONS=--dns-result-order=ipv4first`；`build:binary` 可只跑 bun 步骤；根 build 卡住时逐包构建，`packages/ai` 用 `build:offline`（data 已按 pin hydrate 时 `check:model-data` 会放行） |
 | `./test.sh` 每次挂在不同用例（`worker-lifetime`、`compaction`），单跑全绿 | 20 核并发下计时敏感用例的资源抖动 | 单跑确认后整体重跑；不是升级引入的回归 |
 
 ## 六、版本历史
@@ -304,3 +304,4 @@ diff -u X.merged X.theirs | grep -c '^-[^-]'   # 期望 == diff -u X.ours X.base
 |---|---|---|---|
 | `d5629e204`（0.87.1） | `b9ab918c6`（1.0.3） | `git merge` 零冲突；7/7 present-upstream 补丁零漂移 | 2026-10-09 实测。`npm run check` exit 0；`./test.sh` exit 0；`/health` → `ok`、`/events` → `text/event-stream`、`/prompt` 空 body → 400。修复一处桥的 `this.options` 兼容（见约束 8） |
 | `60c329cea`（1.1.0） | `16f5f0af4`（1.3.0，195 commits） | 6/7 文件自动合并零冲突；`interactive-mode.ts` 3 块冲突，手工解 | 2026-10-21 实测。上游 `38847563f` 把弹窗改成栈式（`pushExtensionDialog`/`removeExtensionDialog`，删掉 `hideExtensionEditor` 与 `extensionEditor` 字段），与桥的 `showExtensionEditor(..., signal?)` 同区冲突。解法：保留上游结构，把 `signal` 重新接进 `finish()`（`onAbort = () => finish(undefined)`、`finish` 里 `removeEventListener` + `removeExtensionDialog(editor)`），删掉我方 `hideExtensionEditor` 副本。delta 等价 7/7 成立（`interactive-mode.ts` +102/-4 vs 原 +106/-4，差 4 行正是不再需要带回 `hideExtensionEditor`）。`npm run check` exit 0；`./test.sh` exit 0；桥 11 passed、args 96 passed；`dist/pi --local-bridge-port 9399` → `/health` `ok`、`/events` `text/event-stream`、`/prompt` 空 body 400。另需 `update:model-catalog-pin` bump（tracked）与移走 `binaries/` 旧缓存 |
+| `7fbdcb45c`（1.3.0） | `936e5f40a`（1.4.0，42 commits） | 唯一冲突 `nix/model-catalog.json`，取上游新 pin；`interactive-mode.ts`、`extensions/types.ts` 均自动合并零冲突 | 2026-10-23 实测。上轮为 v1.3.0 测试固定的 pin（`ce2b35e5…`）让位于上游新 pin（`7fe1b41f…`），按新 pin hydrate 本地 data。根 `npm run build` 在 `packages/ai` 的 `generate-models` 步骤联网 `ETIMEDOUT`（部分 API 不可达），改为逐包构建、ai 用 `build:offline`（`check:model-data` 校验 pin 数据通过）。桥 delta 完整存活（`InputSource` 含 `"bridge"`、`local-bridge-server.ts` 及测试、interactive-mode 桥接线）。`npm run check` exit 0；`./test.sh` exit 0；桥 11 passed、args 96 passed；`dist/pi --local-bridge-port 9399` → `/health` `ok`、`/events` `text/event-stream`、`/prompt` 空 body 400；`packages/env` daemon 构建正常 |
